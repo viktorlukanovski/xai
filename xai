@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import sklearn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from captum.attr import IntegratedGradients
+from captum.attr import Saliency, NoiseTunnel
+from lime.lime_tabular import LimeTabularExplainer
+
+#Neural network used for regression task
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
+        )
+
+    #Defines how input moves forward through network
+    def forward(self, d):
+        return self.net(d) 
+
+
+###################################
+#Data processing
+###################################
+
+#Load dataset
+data = pd.read_csv("insurance.csv")
+
+#Separate input features from target
+x = data.drop("charges", axis=1)
+y = data["charges"]
+#Split dataset into test and training sets, 80% for training, 20% for testing
+X_train, X_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
+
+#Defines numeric and categorical columns
+numeric_features = ["age", "bmi", "children"]
+categorical_features = ["sex", "smoker", "region"]
+
+#Standardizes numerical features, converts categorical features into binary columns
+preprocess = ColumnTransformer(
+    transformers = [("num", StandardScaler(), numeric_features), ("cat", OneHotEncoder(drop="first"), categorical_features)]
+)
+
+#Converts data to PyTorch tensors
+processed_X_train = preprocess.fit_transform(X_train)
+X_train_tensor = torch.tensor(processed_X_train, dtype=torch.float32)
+
+processed_X_test = preprocess.transform(X_test)
+X_test_tensor = torch.tensor(processed_X_test, dtype=torch.float32)
+
+y_train = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+y_test = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+
+#Determines input size after preprocessing
+input_dim = processed_X_train.shape[1]
+network = NeuralNetwork(input_dim)
+
+#Defines loss function for regression
+loss_function = nn.MSELoss()
+#Optimizer updates network weights during training
+optimizer = torch.optim.Adam(network.parameters(), lr=0.001)
+
+#Amount of training iterations
+epochs = 1200
+
+
+#Training loop
+for i in range(epochs):
+    network.train()
+    predictions = network(X_train_tensor)
+    #Calculates training loss
+    loss = loss_function(predictions, y_train)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+network.eval()
+
+#Evaluates model on test set
+with torch.no_grad():
+    predictions_test = network(X_test_tensor)
+    loss_test = loss_function(predictions_test, y_test)
+
+
+###################################
+#XAI Gradient-Based Methods
+###################################
+
+#Vanilla Gradient, Computes gradient of model prediction with respect to input
+def vanilla_grad(nn, x):
+    nn.eval()
+    x = x.clone().detach()
+    x.requires_grad = True
+    pred = nn(x)
+    pred.backward()
+    explanation = x.grad.detach()
+    return explanation
+
+#Integrated Gradients, computes gradients along a path from baseline to actual input
+def integrated_grad(nn, x):
+    nn.eval()
+    grad = IntegratedGradients(nn)
+    zeroes = torch.zeros_like(x)
+    explanation = grad.attribute(x, baselines=zeroes)
+    return explanation
+
+#Smoothgrad, averages saliency maps over versions of noisy input
+def smoothgrad(nn, x):
+    nn.eval()
+    saliency = Saliency(nn)
+    noise_tunnel = NoiseTunnel(saliency)
+    explanation = noise_tunnel.attribute(x, nt_type="smoothgrad", nt_samples=30, stdevs=0.02)
+    return explanation
+
+
+###################################
+#LIME Explanation
+###################################
+
+
+#Retrieves feature names
+feature_names = preprocess.get_feature_names_out()
+
+#Initialize tabular explainer
+lime_explainer = LimeTabularExplainer(training_data=X_train_tensor.numpy(), feature_names=feature_names, mode="regression")
+
+#Prediction function used by LIME, converts NumPy input to Pytorch tensor
+def lime_pred(x):
+    network.eval()
+    tensor = torch.tensor(x, dtype=torch.float32)
+    with torch.no_grad():
+        predictions = network(tensor)
+    return predictions.numpy().reshape(-1)
+
+#Readable explanation for humans, returns explanation that can be printed
+def lime_explanation(nn, x, exp):
+    nn.eval()
+    x_np = x.detach().numpy().reshape(-1)
+    explanation = exp.explain_instance(data_row=x_np, predict_fn=lime_pred, num_features=len(feature_names))
+    return explanation
+
+#Converts LIME explanation into tensor, returns the tensor for comparison
+def lime_explanation_vector(nn, x, exp):
+    nn.eval()
+    x_np = x.detach().numpy().reshape(-1)
+    lime_exp = exp.explain_instance(data_row=x_np, predict_fn=lime_pred, num_features=len(feature_names))
+    weights = np.zeros(len(feature_names))
+    map = lime_exp.as_map()
+    key = list(map.keys())[0]
+    for i, weight in map[key]:
+        weights[i] = weight
+    return torch.tensor(weights, dtype=torch.float32).view(1, -1)
+
+
+###################################
+#Evaluation Functions
+###################################
+
+
+#Calculates cosine similarity between two vectors, returns similarity
+def cos_similarity(x, y):
+    x = x.view(1, -1)
+    y = y.view(1, -1)
+    return F.cosine_similarity(x, y).item()
+
+#Calculates top 3 feature overlap, returns the overlap divided by 3 to evaluate important features
+def top_3(x, y, k=3):
+    x = x.view(-1)
+    y = y.view(-1)
+    top_x = torch.topk(torch.abs(x), k).indices
+    top_y = torch.topk(torch.abs(y), k).indices
+    overlap = len(set(top_x.tolist()).intersection(set(top_y.tolist())))
+    return overlap / k
+
+#Adds noise to numerical features, categorical features unaffected
+def perturb_features(x, noise=0.02):
+    altered = x.clone().detach()
+    altered[:, :3] = altered[:, :3] + torch.randn_like(altered[:, :3]) * noise
+    return altered
+
+
+###################################
+#Evaluation Model Performance
+###################################
+
+#Evaluation code that checks whether the neural network works as intended
+with torch.no_grad():
+    pred_test = network(X_test_tensor)
+    mse = loss_function(predictions_test, y_test)
+    rmse = torch.sqrt(mse)
+    mae = torch.mean(torch.abs(predictions_test - y_test))
+
+#Prints out performance results
+print("MSE:", mse.item())
+print("RMSE:", rmse.item())
+print("MAE:", mae.item())
+print("")
+print("")
+
+
+###################################
+#Robustness Experiment
+###################################
+
+
+#List for evaluation result storage
+results = []
+
+#Number of tests to evaluate
+instances = 50
+#Number of perturbations for each test
+perturbations = 50
+#Max allowed difference in prediction
+pred_threshold = 0.05
+#Noise level used when altering features
+noise = 0.02
+
+#Loops over selected test
+for i in range(instances):
+    x = X_test_tensor[i:i+1]
+    #Prediction with original model 
+    pred = network(x).item()
+    #Creates altered versions of instance
+    for j in range(perturbations):
+        altered_x = perturb_features(x, noise=noise)
+        #Makes prediction for altered instance
+        altered_pred = network(altered_x).item()
+        #Defines prediction differences
+        diff_pred = abs(pred - altered_pred)
+        diff_relative = diff_pred / (abs(pred) + 1e-8)
+
+        #Makes sure that explanations are only compared if stability remains intact, based on threshold defined above
+        if diff_relative <= pred_threshold:
+            #Defines vanilla gradients explanations
+            vanilla_gradients = vanilla_grad(network, x)
+            vanilla_gradients_altered = vanilla_grad(network, altered_x)
+
+            #Defines integrated gradients explanations
+            integrated_gradients = integrated_grad(network, x)
+            integrated_gradients_altered = integrated_grad(network, altered_x)
+            
+            #Defines smoothgrad explanations
+            sg = smoothgrad(network, x)
+            sg_altered = smoothgrad(network, altered_x)
+
+            #Defines lime explanations
+            lime = lime_explanation_vector(network, x, lime_explainer)
+            lime_altered = lime_explanation_vector(network, altered_x, lime_explainer)
+
+            #Stores differences in predictions and similarity scores for explanations
+            results.append({
+                "instance": i,
+                "perturbation": j,
+                "prediction": pred,
+                "altered_prediction": altered_pred,
+                "prediction_difference": diff_pred,
+                "relative_prediction_difference": diff_relative,
+
+                "vanilla_cos": cos_similarity(vanilla_gradients, vanilla_gradients_altered),
+                "integrated_gradients_cos": cos_similarity(integrated_gradients, integrated_gradients_altered),
+                "smoothgrad_cos": cos_similarity(sg, sg_altered),
+                "lime_cos": cos_similarity(lime, lime_altered),
+
+                "vanilla_gradients_top3": top_3(vanilla_gradients, vanilla_gradients_altered, k=3),
+                "integrated_gradients_top3": top_3(integrated_gradients, integrated_gradients_altered, k=3),
+                "smoothgrad_top3": top_3(sg, sg_altered, k=3),
+                "lime_top3": top_3(lime, lime_altered, k=3)
+            })
+
+#Defines pandas dataframe of collected results
+results_df = pd.DataFrame(results)
+print(results_df.head())
+print("\n Amount perturbed cases:", len(results_df))
+rundown = results_df.mean(numeric_only=True)
+print("\n Average results: ")
+print(rundown)
+
+print("")
+print("")
+
+#Prints summary of the main metrics
+rundown_methods = results_df[[
+    "vanilla_cos", "integrated_gradients_cos", "smoothgrad_cos", "lime_cos", "vanilla_gradients_top3", "integrated_gradients_top3", "smoothgrad_top3", "lime_top3"
+]].mean()
+print(rundown_methods)
