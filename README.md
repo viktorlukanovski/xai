@@ -1,4 +1,4 @@
-XAI Robustness Experiment on Medical Insurance Cost Prediction
+XAI Medical Insurance Cost Prediction
 
 This repository contains the code, dataset and README for the final assignment for course xAI.
 
